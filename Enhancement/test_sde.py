@@ -14,6 +14,9 @@ from tqdm import tqdm
 ROOT_DIR = osp.abspath(osp.join(osp.dirname(__file__), osp.pardir))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+ENHANCEMENT_DIR = osp.abspath(osp.dirname(__file__))
+if ENHANCEMENT_DIR not in sys.path:
+    sys.path.insert(0, ENHANCEMENT_DIR)
 
 import utils
 from basicsr.data import create_dataloader, create_dataset
