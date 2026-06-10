@@ -10,6 +10,136 @@ import glob
 import os
 import functools
 
+try:
+    from natsort import natsorted
+except ImportError:
+    natsorted = sorted
+
+IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+
+
+def _image_file_list(root):
+    return natsorted([
+        path for path in glob.glob(osp.join(root, '*'))
+        if osp.isfile(path) and path.lower().endswith(IMG_EXTENSIONS)
+    ])
+
+
+def _read_rgb_tensor(path, size=None):
+    img = util.read_img(None, path, size)
+    img = img[:, :, [2, 1, 0]]
+    img = torch.from_numpy(
+        np.ascontiguousarray(np.transpose(img, (2, 0, 1)))).float()
+    return img
+
+
+def _paired_random_crop_tensor(img_lq, img_gt, gt_size):
+    _, h, w = img_gt.shape
+    pad_h = max(0, gt_size - h)
+    pad_w = max(0, gt_size - w)
+    if pad_h != 0 or pad_w != 0:
+        pad = (0, pad_w, 0, pad_h)
+        img_lq = F.pad(img_lq.unsqueeze(0), pad, mode='replicate').squeeze(0)
+        img_gt = F.pad(img_gt.unsqueeze(0), pad, mode='replicate').squeeze(0)
+        _, h, w = img_gt.shape
+
+    top = random.randint(0, h - gt_size)
+    left = random.randint(0, w - gt_size)
+    img_lq = img_lq[:, top:top + gt_size, left:left + gt_size]
+    img_gt = img_gt[:, top:top + gt_size, left:left + gt_size]
+    return img_lq, img_gt
+
+
+class Dataset_SDSDEventImage(data.Dataset):
+    """RGB frame pairs from the SDSD event release.
+
+    Expected layout:
+        dataroot/
+            pair1/
+                low/*.png
+                normal/*.png
+                low_event/*.h5 or event npz files are ignored
+
+    Low and normal frame timestamps can differ, so frames are paired by
+    natural sorted order inside each scene.
+    """
+
+    def __init__(self, opt):
+        super(Dataset_SDSDEventImage, self).__init__()
+        self.opt = opt
+        self.root = osp.expanduser(opt['dataroot'])
+        self.low_dir = opt.get('low_dir', 'low')
+        self.gt_dir = opt.get('gt_dir', 'normal')
+        self.train_size = opt.get('train_size', None)
+        self.gt_size = opt.get('gt_size', None)
+        self.use_flip = opt.get('use_flip', opt.get('geometric_augs', True))
+        self.use_rot = opt.get('use_rot', opt.get('geometric_augs', True))
+
+        if not osp.isdir(self.root):
+            raise FileNotFoundError(f'SDSD dataroot does not exist: {self.root}')
+
+        self.paths = self._scan_pairs()
+        if len(self.paths) == 0:
+            raise ValueError(f'No SDSD RGB image pairs found in {self.root}')
+
+    def _scan_pairs(self):
+        pairs = []
+        scene_dirs = [
+            path for path in glob.glob(osp.join(self.root, '*'))
+            if osp.isdir(path)
+        ]
+        for scene_dir in natsorted(scene_dirs):
+            scene = osp.basename(scene_dir)
+            low_folder = osp.join(scene_dir, self.low_dir)
+            gt_folder = osp.join(scene_dir, self.gt_dir)
+            if not osp.isdir(low_folder) or not osp.isdir(gt_folder):
+                continue
+
+            low_paths = _image_file_list(low_folder)
+            gt_paths = _image_file_list(gt_folder)
+            if len(low_paths) != len(gt_paths):
+                raise ValueError(
+                    f'SDSD pair count mismatch in {scene}: '
+                    f'{len(low_paths)} low images vs {len(gt_paths)} GT images')
+
+            for frame_idx, (lq_path, gt_path) in enumerate(zip(low_paths, gt_paths)):
+                pairs.append({
+                    'lq_path': lq_path,
+                    'gt_path': gt_path,
+                    'scene': scene,
+                    'frame_idx': frame_idx
+                })
+        return pairs
+
+    def __getitem__(self, index):
+        index = index % len(self.paths)
+        pair = self.paths[index]
+
+        img_lq = _read_rgb_tensor(pair['lq_path'], self.train_size)
+        img_gt = _read_rgb_tensor(pair['gt_path'], self.train_size)
+
+        if self.opt['phase'] == 'train':
+            if self.gt_size is not None:
+                img_lq, img_gt = _paired_random_crop_tensor(
+                    img_lq, img_gt, self.gt_size)
+            img_lq, img_gt = util.augment_torch(
+                [img_lq, img_gt], self.use_flip, self.use_rot)
+
+        return {
+            'lq': img_lq,
+            'gt': img_gt,
+            'folder': pair['scene'],
+            'idx': f"{pair['frame_idx']}/{len(self.paths)}",
+            'border': 0,
+            'scene': pair['scene'],
+            'frame_idx': pair['frame_idx'],
+            'lq_path': pair['lq_path'],
+            'gt_path': pair['gt_path']
+        }
+
+    def __len__(self):
+        return len(self.paths)
+
 
 class Dataset_SDSDImage(data.Dataset):
     def __init__(self, opt):
